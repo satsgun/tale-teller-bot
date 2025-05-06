@@ -1,0 +1,30 @@
+story_id,language,title,file_path,audio_file_path
+eng_001,English,The Hare and the Tortoise,English/eng_001.txt,English/sage_gpt-4o-mini-tts_1x_2025-04-11T10_27_19-352Z_eng_001.mp3
+eng_002,English,The Shepherd Boy and the Wolf,English/eng_002.txt,English/sage_gpt-4o-mini-tts_1x_2025-04-11T11_18_42-561Z_eng_002.mp3
+eng_003,English,The Ants and the Grasshopper,English/eng_003.txt,English/sage_gpt-4o-mini-tts_1x_2025-04-11T11_22_12-904Z_eng_003.mp3
+eng_004,English,The Fox and the Grapes,English/eng_004.txt,English/sage_gpt-4o-mini-tts_1x_2025-04-11T11_24_31-685Z_eng_004.mp3
+eng_005,English,The Lion and the Mouse,English/eng_005.txt,English/sage_gpt-4o-mini-tts_1x_2025-04-11T11_28_05-039Z_eng_005.mp3
+
+mar_001,Marathi,ससाण आणि कासव,Marathi/mar_001.txt,Marathi/sage_gpt-4o-mini-tts_1x_2025-04-11T12_05_37-993Z_mar_001.mp3
+mar_002,Marathi,सिंह आणि उंदीर,Marathi/mar_002.txt,Marathi/sage_gpt-4o-mini-tts_1x_2025-04-11T11_56_16-340Z_mar_002.mp3
+mar_003,Marathi,कोल्ही आणि द्राक्षे,Marathi/mar_003.txt,Marathi/sage_gpt-4o-mini-tts_1x_2025-04-11T11_58_00-643Z_mar_003.mp3
+mar_004,Marathi,चीट्या आणि टिड्डा,Marathi/mar_004.txt,Marathi/sage_gpt-4o-mini-tts_1x_2025-04-11T11_59_31-994Z_mar_004.mp3
+mar_005,Marathi,गोंधळ्या मुलगा आणि लांडगा,Marathi/mar_005.txt,Marathi/sage_gpt-4o-mini-tts_1x_2025-04-11T12_01_01-147Z_mar_005.mp3
+
+hin_001,Hindi,खरगोश और कछुआ,Hindi/hin_001.txt,Hindi/sage_gpt-4o-mini-tts_1x_2025-04-11T10_35_49-099Z_hin_001.mp3
+hin_002,Hindi,शेर और चूहा,Hindi/hin_002.txt,Hindi/sage_gpt-4o-mini-tts_1x_2025-04-11T11_00_15-161Z_hin_002.mp3
+hin_003,Hindi,लोमड़ी और अंगूर,Hindi/hin_003.txt,Hindi/sage_gpt-4o-mini-tts_1x_2025-04-11T11_05_07-801Z_hin_003.mp3
+hin_004,Hindi,चींटियाँ और टिड्डा,Hindi/hin_004.txt,Hindi/sage_gpt-4o-mini-tts_1x_2025-04-11T11_07_50-326Z_hin_004.mp3
+hin_005,Hindi,चरवाहा लड़का और भेड़िया,Hindi/hin_005.txt,Hindi/sage_gpt-4o-mini-tts_1x_2025-04-11T11_12_12-081Z_hin_005.mp3
+
+tam_001,Tamil,சிங்கம் மற்றும் எலி,Tamil/tam_001.txt,Tamil/sage_gpt-4o-mini-tts_1x_2025-04-11T11_44_45-182Z_tam_001.mp3
+tam_002,Tamil,நரி மற்றும் திராட்சைகள்,Tamil/tam_002.txt,Tamil/sage_gpt-4o-mini-tts_1x_2025-04-11T11_47_19-384Z_tam_002.mp3
+tam_003,Tamil,எறும்புகளும் சிலம்பியும்,Tamil/tam_003.txt,Tamil/sage_gpt-4o-mini-tts_1x_2025-04-11T11_49_16-774Z_tam_003.mp3
+tam_004,Tamil,மேய்ப்பையன் மற்றும் ஓநாய்,Tamil/tam_004.txt,Tamil/sage_gpt-4o-mini-tts_1x_2025-04-11T11_51_59-618Z_tam_004.mp3
+tam_005,Tamil,முயல் மற்றும் ஆமை,Tamil/tam_005.txt,Tamil/sage_gpt-4o-mini-tts_1x_2025-04-11T11_54_18-002Z_tam_005.mp3
+
+urd_001,Urdu,شیر اور چوہا,Urdu/urd_001.txt,Urdu/sage_gpt-4o-mini-tts_1x_2025-04-11T11_31_24-330Z_urd_001.mp3
+urd_002,Urdu,لومڑی اور انگور,Urdu/urd_002.txt,Urdu/sage_gpt-4o-mini-tts_1x_2025-04-11T11_34_13-956Z_urd_002.mp3
+urd_003,Urdu,چیونیاں اور ٹڈی,Urdu/urd_003.txt,Urdu/sage_gpt-4o-mini-tts_1x_2025-04-11T11_36_43-172Z_urd_003.mp3
+urd_004,Urdu,چرواہا لڑکا اور بھیڑیا,Urdu/urd_004.txt,Urdu/sage_gpt-4o-mini-tts_1x_2025-04-11T11_39_00-326Z_urd_004.mp3
+urd_005,Urdu,خرگوش اور کچھوا,Urdu/urd_005.txt,Urdu/sage_gpt-4o-mini-tts_1x_2025-04-11T11_42_11-325Z_urd_005.mp3
