@@ -1,0 +1,7 @@
+langgraph 
+langgraph-checkpoint-sqlite 
+langgraph-prebuilt 
+langchain-google-genai 
+pandas 
+langchain-core 
+google-genai
