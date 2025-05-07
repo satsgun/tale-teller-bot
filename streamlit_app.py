@@ -1,4 +1,3 @@
-# streamlit_app.py
 import streamlit as sl
 import os
 import random
@@ -9,89 +8,326 @@ import json
 import uuid
 import time
 from pathlib import Path  # Use pathlib for better path handling
-from dotenv import load_dotenv
 
 # --- LangChain & LangGraph ---
-# Ensure libraries are installed in the environment (e.g., requirements.txt)
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
+from langchain_core.messages import (
+    HumanMessage,
+    AIMessage,
+    SystemMessage,
+    BaseMessage,
+    ToolMessage,
+)
+from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
+
+# --- Google AI ---
+from google import genai  # For multimodal model
 
 # --- Configuration ---
 # Assume dataset is in a 'data' subdirectory relative to the script
 # OR configure via environment variable
-DATASET_DIR_NAME = "stories"  # Keep the folder name consistent
-APP_DIR = Path(__file__).parent  # Get the directory where the script is running
-DATASET_PATH = Path(
-    os.environ.get("DATASET_PATH", APP_DIR / "data" / DATASET_DIR_NAME)
-)  # Env var or default location
+DATASET_DIR_NAME = "stories" 
+APP_DIR = Path(__file__).parent
+DATASET_PATH = Path(os.environ.get("DATASET_PATH", APP_DIR / "data" / DATASET_DIR_NAME))
 MANIFEST_FILENAME = "stories_manifest.csv"
 DEFAULT_LANGUAGE = "English"
 MANIFEST_FULL_PATH = DATASET_PATH / MANIFEST_FILENAME
 
 # --- Validate Dataset Path ---
-if not DATASET_PATH.is_dir() or not MANIFEST_FULL_PATH.is_file():
-    sl.error(
-        f"Error: Dataset path '{DATASET_PATH}' not found or manifest '{MANIFEST_FILENAME}' missing."
-    )
+dataset_ok = True
+if not DATASET_PATH.is_dir():
+    sl.error(f"Error: Dataset directory '{DATASET_PATH}' not found.")
     sl.error(
         "Please ensure the dataset folder exists relative to the script or set the DATASET_PATH environment variable."
     )
-    sl.stop()  # Stop execution if dataset is missing
+    dataset_ok = False
+if not MANIFEST_FULL_PATH.is_file():
+    sl.error(
+        f"Error: Manifest file '{MANIFEST_FILENAME}' not found in '{DATASET_PATH}'."
+    )
+    dataset_ok = False
+if not dataset_ok:
+    sl.stop()
 
 # --- Google AI API Key Setup ---
-# ** READ FROM ENV FILE **
-load_dotenv()
-GOOGLE_AI_API_KEY = os.getenv("GOOGLE_AI_API_KEY")
-
+api_key = sl.secrets["GOOGLE_AI_API_KEY"]
 LLM_READY = False
-llm = None
-if GOOGLE_AI_API_KEY:
-    try:
+MM_LLM_READY = False
+llm = None  # For text chat/planning
+mm_llm = None  # For audio analysis
+MODEL = "gemini-2.5-flash-preview-04-17"
+if api_key:
+    try:               
         llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash-latest",
-            google_api_key=GOOGLE_AI_API_KEY,
+            google_api_key=api_key,
+            model=MODEL,            
             temperature=0.3,
         )
-        print(f"Google AI LLM Model initialized ('{llm.model}').")
+        print(f"Google AI Chat LLM Model initialized ('{llm.model}').")
         LLM_READY = True
+
+        # Initialize Multimodal LLM (can potentially use the same API key)
+        mm_llm = genai.Client(api_key=api_key)    
+        print(f"Google AI Multimodal LLM Model initialized ('{mm_llm}').")
+        MM_LLM_READY = True
     except Exception as e:
-        sl.error(f"ERROR during Google AI (Gemini) Setup: {e}")
+        sl.error(f"ERROR during Google AI Setup: {e}")
         LLM_READY = False
+        MM_LLM_READY = False
 else:
     sl.error(
-        "GOOGLE_AI_API_KEY environment variable not set. Storyteller functionality disabled."
+        "GOOGLE_API_KEY environment variable not set. Storyteller functionality disabled."
     )
-    # sl.stop() # Optionally stop if LLM is critical
 
 
 # --- LangGraph State Definition ---
 class StorytellerAgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
-    dataset_base_path: str  # Store as string for checkpointer
+    dataset_base_path: str
     stories_manifest: Optional[List[Dict]]
     supported_languages_map: Dict[str, str]
     selected_language: str
     stories_to_play_cycle: List[str]
     played_in_cycle: List[str]
     error_message: Optional[str]
+    # --- Fields for selected story data ---
     selected_story_id: Optional[str]
-    selected_story_title: Optional[str]
-    selected_story_content: Optional[str]
-    selected_audio_path: Optional[str]
+    current_story_title: Optional[str]  # Changed from selected_story_title for clarity
+    selected_story_content: Optional[str]  # Text content
+    current_audio_path: Optional[str]  # Changed from selected_audio_path for clarity
+    # --- Transient fields for control flow ---
     user_request_type: Optional[str]
     extracted_language: Optional[str]
-    output_audio_path: Optional[str]
+    output_audio_path: Optional[str]  # Signal to runner function to play audio
+    ai_moral_result: Optional[str]  # Store the moral generated by AI
 
+
+# --- Tool Logic Functions ---
+
+
+def get_available_languages_logic(state: StorytellerAgentState) -> dict:
+    """Logic to get available languages."""
+    print("--- Tool Logic: get_available_languages ---")
+    supported_map = state.get("supported_languages_map", {})
+    available_langs = list(supported_map.keys())
+    if not available_langs:
+        result_str = "I currently don't have information about supported languages."
+    else:
+        result_str = f"I can tell stories in: {', '.join(sorted(available_langs))}."
+    return {"source_tool": "get_available_languages", "result_for_llm": result_str}
+
+
+def set_language_logic(state: StorytellerAgentState, language_name: str) -> dict:
+    """Logic to set the language."""
+    print(f"--- Tool Logic: set_language (Requested: {language_name}) ---")
+    supported_map = state.get("supported_languages_map", {})
+    available_langs = list(supported_map.keys())
+    current_lang = state.get("selected_language")
+    result_data = {
+        "source_tool": "set_language",
+        "success": False,
+        "new_language": current_lang,
+        "reset_cycle": False,
+        "result_for_llm": "",
+    }
+    if not supported_map:
+        result_data["result_for_llm"] = "Language support info not loaded."
+    elif not language_name:
+        result_data["result_for_llm"] = (
+            f"Please specify language. Options: {', '.join(sorted(available_langs))}."
+        )
+    else:
+        target_lang = next(
+            (lang for lang in available_langs if language_name.lower() == lang.lower()),
+            None,
+        )
+        if target_lang:
+            if target_lang == current_lang:
+                result_data["result_for_llm"] = (
+                    f"Language already set to {target_lang}."
+                )
+                result_data["success"] = True
+            else:
+                result_data["result_for_llm"] = (
+                    f"Okay, language switched to {target_lang}."
+                )
+                result_data["success"] = True
+                result_data["new_language"] = target_lang
+                result_data["reset_cycle"] = True
+                print(f"Lang changed to: {target_lang}")
+        else:
+            result_data["result_for_llm"] = (
+                f"Sorry, '{language_name}' not supported. Available: {', '.join(sorted(available_langs))}."
+            )
+    return result_data
+
+
+def get_story_logic(state: StorytellerAgentState) -> dict:
+    """Selects next story, fetches audio path and title."""
+    print("--- Tool Logic: get_story ---")
+    language = state.get("selected_language")
+    manifest_list = state.get("stories_manifest")
+    base_path = state.get("dataset_base_path")
+    stories_to_play = state.get("stories_to_play_cycle", [])
+    played_in_cycle = state.get("played_in_cycle", [])
+    result_data = {
+        "source_tool": "get_story",
+        "story_id": None,
+        "title": None,
+        "audio_path": None,
+        "error": None,
+        "result_for_llm": "",
+        "updated_stories_to_play": list(stories_to_play),
+        "updated_played_in_cycle": list(played_in_cycle),
+        "story_selected_this_call": False,
+    }
+    if not language or manifest_list is None or base_path is None:
+        result_data["error"] = "Config incomplete."
+        result_data["result_for_llm"] = "Error: Config incomplete."
+        return result_data
+    try:
+        current_lang_stories = [
+            s for s in manifest_list if s.get("language") == language
+        ]
+        if not current_lang_stories:
+            raise ValueError(f"No stories for language '{language}'.")
+        current_lang_story_ids = list(set(s["story_id"] for s in current_lang_stories))
+        temp_stories_to_play = list(result_data["updated_stories_to_play"])
+        temp_played_in_cycle = list(result_data["updated_played_in_cycle"])
+        needs_reset = not temp_stories_to_play or set(temp_played_in_cycle) == set(
+            current_lang_story_ids
+        )
+        if needs_reset:
+            if set(temp_played_in_cycle) == set(current_lang_story_ids):
+                print("Reshuffling cycle...")
+            else:
+                print("Initializing cycle.")
+            temp_stories_to_play = current_lang_story_ids.copy()
+            random.shuffle(temp_stories_to_play)
+            temp_played_in_cycle = []
+            last_played = played_in_cycle[-1] if played_in_cycle else None
+            if (
+                len(temp_stories_to_play) > 1
+                and last_played
+                and temp_stories_to_play[0] == last_played
+            ):
+                temp_stories_to_play.pop(0)  # Simple avoidance
+        if temp_stories_to_play:
+            story_id = temp_stories_to_play.pop(0)
+            temp_played_in_cycle.append(story_id)
+            result_data["story_id"] = story_id
+            result_data["story_selected_this_call"] = True
+            result_data["updated_stories_to_play"] = temp_stories_to_play
+            result_data["updated_played_in_cycle"] = temp_played_in_cycle
+            print(f"Selected story ID: {story_id}")
+            story_entry = next(
+                (s for s in current_lang_stories if s["story_id"] == story_id), None
+            )
+            if not story_entry:
+                raise FileNotFoundError("Manifest entry missing.")
+            relative_audio_path = story_entry.get("audio_file_path")
+            result_data["title"] = story_entry["title"]
+            if not relative_audio_path:
+                raise ValueError("audio_file_path missing.")
+            full_audio_path = str(
+                Path(base_path) / relative_audio_path.lstrip("/\\")
+            )  # Use Pathlib for robustness
+            if not os.path.exists(full_audio_path):
+                raise FileNotFoundError(f"Audio file not found: {full_audio_path}")
+            result_data["audio_path"] = full_audio_path
+            print(f"Found audio path: {full_audio_path}")
+            result_data["result_for_llm"] = (
+                f"Successfully prepared story: {result_data['title']}"
+            )
+        else:
+            result_data["error"] = "Failed to select story (cycle empty/no stories)."
+            result_data["result_for_llm"] = "Sorry, couldn't find story (cycle empty)."
+    except Exception as e:
+        result_data["error"] = f"Error in get_story: {e}"
+        print(result_data["error"])
+        result_data["result_for_llm"] = f"Error getting story: {e}"
+        result_data["story_id"] = None
+        result_data["title"] = None
+        result_data["audio_path"] = None
+        result_data["story_selected_this_call"] = False
+    return result_data
+
+
+def get_moral_from_audio_logic(state: StorytellerAgentState) -> dict:
+    """Stub logic for getting moral from audio."""
+    print("--- Tool Logic: get_moral_from_audio (STUB) ---")
+    audio_path = state.get("current_audio_path")
+    story_title = state.get("current_story_title", "the story")
+    result_data = {
+        "source_tool": "get_moral_from_audio",
+        "ai_moral": None,
+        "error": None,
+        "result_for_llm": "",
+    }
+    if not MM_LLM_READY or not mm_llm:
+        result_data["error"] = "Multimodal LLM not available."
+        result_data["result_for_llm"] = "Sorry, I cannot analyze audio right now."
+    elif not audio_path or not os.path.exists(audio_path):
+        result_data["error"] = "Audio file path missing or invalid."
+        result_data["result_for_llm"] = "Sorry, I don't have the audio file to analyze."
+    else:
+        print(f"Stub: Would analyze audio '{audio_path}' for story '{story_title}'.")
+        placeholder_moral = "The feature to analyze audio for its moral is currently under development. Please ask again later!"
+        result_data["ai_moral"] = placeholder_moral
+        result_data["result_for_llm"] = f"AI Moral Analysis (Stub): {placeholder_moral}"
+    return result_data
+
+
+# --- LangChain Tool Wrappers ---
+@tool
+def get_available_languages() -> str:
+    """Returns a list of languages the storyteller supports."""
+    print("Executing @tool get_available_languages wrapper")
+    return "Fetching available languages..."
+
+
+@tool
+def set_language(language_name: str) -> str:
+    """Sets the storyteller's language. Requires the exact language name (e.g. 'English', 'Español')."""
+    print(f"Executing @tool set_language wrapper for {language_name}")
+    return f"Attempting to set language to {language_name}..."
+
+
+@tool
+def get_story() -> str:
+    """Selects the next available story in the current language and prepares its audio path and title for playback and discussion."""
+    print("Executing @tool get_story wrapper")
+    return "Getting the next story..."
+
+
+@tool
+def get_moral_from_audio(story_title: Optional[str] = None) -> str:
+    """
+    Analyzes the audio of the story currently being discussed to determine its moral.
+    Use this AFTER a story's audio has been presented and the user asks specifically for its moral.
+    The story_title argument is optional context.
+    """
+    print(f"Executing @tool get_moral_from_audio wrapper (Story: {story_title})")
+    return "Analyzing audio for its moral..."
+
+
+tools = [get_available_languages, set_language, get_story, get_moral_from_audio]
+if llm:
+    print("Binding tools to LLM...")
+    llm_with_tools = llm.bind_tools(tools)    
+    if llm_with_tools:
+        print(f"LLM with tools bound: {llm_with_tools}")
+else:
+    llm_with_tools = None
+print("\n--- Tool Logic and Wrappers Defined ---")
 
 # --- Node Function Definitions ---
-# (Copy the LATEST versions of load_manifest_and_languages_node,
-# determine_intent_llm_node, handle_language_change_node,
-# filter_stories_by_language_node, select_story_node,
-# fetch_story_data_node, format_response_node here. They remain the same.)
-# --- PASTE NODE DEFINITIONS HERE ---
+
+
 def load_manifest_and_languages_node(state: StorytellerAgentState) -> dict:
     print("--- Node: load_manifest_and_languages ---")
     if (
@@ -107,7 +343,10 @@ def load_manifest_and_languages_node(state: StorytellerAgentState) -> dict:
         ):
             return {"error_message": None}
         return {}
-    base_path = state["dataset_base_path"]
+    # Use Path object correctly
+    base_path = str(
+        state["dataset_base_path"]
+    )  # Convert Path back to string if needed by os.path.join
     manifest_path = os.path.join(base_path, MANIFEST_FILENAME)
     manifest_list = None
     languages_map = {}
@@ -159,344 +398,164 @@ def load_manifest_and_languages_node(state: StorytellerAgentState) -> dict:
     return update_dict
 
 
-def determine_intent_llm_node(state: StorytellerAgentState) -> dict:
-    print("--- Node: determine_intent_llm ---")
-    error = state.get("error_message")
-    if state.get("stories_manifest") is None or not state.get(
-        "supported_languages_map"
-    ):
-        if not error:
-            error = "Manifest/Language data failed to load previously."
-        print(f"Critical Error before intent: {error}")
+def agent_node(state: StorytellerAgentState) -> dict:
+    """Invokes the LLM to decide the next action or respond."""
+    print("--- Node: agent (LLM Planning) ---")
+    if state.get("error_message") and "Manifest" in state["error_message"]:
         return {
-            "user_request_type": "error_state",
-            "error_message": error,
-            "selected_story_id": None,
-            "selected_story_title": None,
-            "selected_story_content": None,
-            "selected_audio_path": None,
-            "output_audio_path": None,
+            "messages": [AIMessage(content=f"Cannot proceed: {state['error_message']}")]
         }
-    if not LLM_READY or not llm:
-        print("LLM not available, using basic keyword intent detection.")
-        user_message = state["messages"][-1].content.lower()
-        request_type = "unknown"
-        if "story" in user_message or "tell me" in user_message:
-            request_type = "request_story"
-        elif "hello" in user_message or "hi" in user_message:
-            request_type = "greeting"
-        elif "language" in user_message:
-            request_type = "ask_language_options"
-        return {
-            "user_request_type": request_type,
-            "extracted_language": None,
-            "error_message": error,
-            "selected_story_id": None,
-            "selected_story_title": None,
-            "selected_story_content": None,
-            "selected_audio_path": None,
-            "output_audio_path": None,
-        }
-    human_input = state["messages"][-1].content
-    history = state["messages"][:-1]
-    chat_history_str = "\n".join(
-        [
-            f"{'User' if isinstance(m, HumanMessage) else 'Bot'}: {m.content}"
-            for m in history[-4:]
-        ]
+    if not LLM_READY or not llm_with_tools:
+        return {"messages": [AIMessage(content="Text planning component offline.")]}
+    messages_for_llm = state.get("messages", [])
+    if not messages_for_llm:
+        messages_for_llm = [HumanMessage(content="<Start>")]
+    current_lang = state.get("selected_language", "None")
+    current_story_title_for_prompt = state.get(
+        "current_story_title", "None currently selected"
     )
-    available_lang_list = list(state.get("supported_languages_map", {}).keys())
-    available_lang_str = (
-        ", ".join(sorted(available_lang_list))
-        if available_lang_list
-        else "None specified"
-    )
-    prompt = f"""Analyze the user's latest message to a storyteller bot. Classify the intent: request_story, \
-    greeting, ask_language_options, set_language, inquire_capabilities, unknown.
-    Available languages: {available_lang_str}
-    If intent is 'set_language', extract the language name.
-    History: {chat_history_str}
-    User Message: "{human_input}" Output ONLY JSON: {{"intent": "...", "language": "..." or null}}"""
-    request_type = "unknown"
-    extracted_lang = None
-    llm_error = None
-    try:
-        print("Calling LLM for intent detection...")
-        llm_response = llm.invoke(prompt)
-        response_text = llm_response.content.strip()
-        print(f"LLM Raw Response: {response_text}")
-        try:
-            if response_text.startswith("```json"):
-                response_text = response_text.strip("```json").strip()
-            elif response_text.startswith("```"):
-                response_text = response_text.strip("```").strip()
-            intent_data = json.loads(response_text)
-            request_type = intent_data.get("intent", "unknown")
-            extracted_lang = intent_data.get("language")
-            print(f"LLM Classified Intent: {request_type}, Language: {extracted_lang}")
-        except json.JSONDecodeError:
-            print(f"LLM response not valid JSON: {response_text}")
-            llm_error = "LLM response parse error."
-    except Exception as e:
-        print(f"Error calling LLM: {e}")
-        llm_error = f"LLM API call failed: {e}"
-    final_error = error or llm_error
-    return {
-        "user_request_type": request_type,
-        "extracted_language": extracted_lang,
-        "error_message": final_error,
-        "selected_story_id": None,
-        "selected_story_title": None,
-        "selected_story_content": None,
-        "selected_audio_path": None,
-        "output_audio_path": None,
-    }
+    system_prompt = f"""You are a friendly, multilingual Storyteller Bot. Current language: {current_lang}. Current story: '{current_story_title_for_prompt}'.
+Available Tools:
+- get_story(): Gets the NEXT random story audio/title in {current_lang}. Use for general requests ('tell story', 'another').
+- get_moral_from_audio(story_title: str): Analyzes audio of '{current_story_title_for_prompt}' for its moral. Use AFTER story audio is presented AND user asks for moral/analysis. Pass title '{current_story_title_for_prompt}'.
+- get_available_languages(): Lists supported languages.
+- set_language(language_name: str): Switches language. Requires exact name.
+
+Interaction Flow:
+1. If user asks for story, call `get_story`. Tool will return success message with title. Your reply then MUST be: "Okay, here is the story '[TITLE]'. Listen to the audio (it should play automatically)." (Do NOT ask about moral yet).
+2. If user asks for the moral AFTER a story, call `get_moral_from_audio`.
+3. After `get_moral_from_audio` tool runs, it gives you the result. Present it clearly: "Based on the analysis, the moral seems to be: [MORAL TEXT]."
+4. Handle language requests with respective tools.
+5. Respond directly to greetings or capability questions. If unsure, ask for clarification."""
+    messages_with_system = [SystemMessage(content=system_prompt)] + messages_for_llm
+    response = llm_with_tools.invoke(messages_with_system)
+    print(f"LLM Response Type: {type(response)}")
+    return {"messages": [response]}
 
 
-def handle_language_change_node(state: StorytellerAgentState) -> dict:
-    print("--- Node: handle_language_change ---")
-    intent = state.get("user_request_type")
-    requested_lang = state.get("extracted_language")
-    supported_map = state.get("supported_languages_map", {})
-    available_langs = list(supported_map.keys())
-    current_lang = state.get("selected_language")
-    response_message = ""
-    new_lang_set = False
-    updates = {"error_message": None}
-    if not supported_map:
-        response_message = "Language support info not loaded."
-    elif intent == "ask_language_options":
-        response_message = (
-            f"I can tell stories in: {', '.join(sorted(available_langs))}. Which one?"
-        )
-    elif intent == "set_language":
-        target_lang = next(
-            (
-                lang
-                for lang in available_langs
-                if requested_lang and requested_lang.lower() == lang.lower()
-            ),
-            None,
-        )
-        if target_lang:
-            if target_lang == current_lang:
-                response_message = f"Already set to {target_lang}."
-            else:
-                response_message = f"Okay, language switched to {target_lang}."
-                updates["selected_language"] = target_lang
-                updates["stories_to_play_cycle"] = []
-                updates["played_in_cycle"] = []
-                new_lang_set = True
-                print(f"Lang changed to {target_lang}")
-        elif requested_lang:
-            response_message = f"Sorry, '{requested_lang}' not supported. Available: {', '.join(sorted(available_langs))}."
-        else:
-            response_message = (
-                f"Which language? Options: {', '.join(sorted(available_langs))}."
-            )
-    else:
-        response_message = "Language handling error."
-    ai_message = AIMessage(content=response_message)
-    updates["messages"] = add_messages(state.get("messages", []), [ai_message])
-    updates["user_request_type"] = "language_processed"
-    return updates
+def update_state_after_tool_node(state: StorytellerAgentState) -> dict:
+    """Calls tool logic based on LLM request and updates state."""
+    print("--- Node: update_state_after_tool ---")
+    messages = state.get("messages", [])
+    last_message = messages[-1] if messages else None
+    # Initialize state updates, clear transient playback/moral fields from previous turn
+    state_updates = {"output_audio_path": None, "ai_moral_result": None}
+    if not isinstance(last_message, ToolMessage):
+        print("Warning: Expected ToolMessage.")
+        return state_updates
 
-
-def filter_stories_by_language_node(state: StorytellerAgentState) -> dict:
-    print("--- Node: filter_stories_by_language ---")
-    manifest_list = state.get("stories_manifest")
-    language = state.get("selected_language")
-    error = state.get("error_message")
-    stories_to_play = state.get("stories_to_play_cycle", [])
-    played_in_cycle = state.get("played_in_cycle", [])
-    updates = {"error_message": error}
-    if error:
-        print("Skipping filter due to previous error.")
-        return updates
-    if not language:
-        updates["error_message"] = "Cannot filter: Language not selected."
-        print(updates["error_message"])
-        return updates
-    if manifest_list is None:
-        updates["error_message"] = "Cannot filter: Manifest not loaded."
-        print(updates["error_message"])
-        return updates
-    try:
-        current_lang_stories = [
-            s for s in manifest_list if s.get("language") == language
-        ]
-        if not current_lang_stories:
-            raise ValueError(f"No stories found for '{language}'.")
-        current_lang_story_ids = list(set(s["story_id"] for s in current_lang_stories))
-        needs_reset = not stories_to_play or set(played_in_cycle) == set(
-            current_lang_story_ids
-        )
-        if needs_reset:
-            if set(played_in_cycle) == set(current_lang_story_ids):
-                print("Reshuffling cycle...")
-            else:
-                print("Initializing cycle.")
-            stories_to_play = current_lang_story_ids.copy()
-            random.shuffle(stories_to_play)
-            played_in_cycle = []
-            last_played = (
-                state.get("played_in_cycle", [])[-1]
-                if state.get("played_in_cycle")
-                else None
-            )
-            if (
-                len(stories_to_play) > 1
-                and last_played
-                and stories_to_play[0] == last_played
-            ):
-                stories_to_play.pop(0)
-        updates["stories_to_play_cycle"] = stories_to_play
-        updates["played_in_cycle"] = played_in_cycle
-        updates["error_message"] = None
+    tool_name_called = None
+    tool_args = {}
+    aim_with_tool_call = None
+    for i in range(len(messages) - 2, -1, -1):
+        msg = messages[i]
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                if tc["id"] == last_message.tool_call_id:
+                    tool_name_called = tc["name"]
+                    tool_args = tc["args"]
+                    aim_with_tool_call = msg
+                    break
+            if tool_name_called:
+                break
+    if not tool_name_called:
         print(
-            f"Filtered {len(current_lang_story_ids)} stories for '{language}'. Cycle has {len(stories_to_play)} remaining."
+            f"Error: No corresponding tool call for ToolMessage ID {last_message.tool_call_id}."
         )
-    except Exception as e:
-        updates["error_message"] = f"Error filtering: {e}"
-        print(updates["error_message"])
-    return updates
+        state_updates["error_message"] = "Internal error matching tool result."
+        last_message.content = "Error: Failed to identify tool call."
+        return {**state_updates, "messages": messages}
 
-
-def select_story_node(state: StorytellerAgentState) -> dict:
-    print("--- Node: select_story ---")
-    stories_to_play = state.get("stories_to_play_cycle", [])
-    played_in_cycle = state.get("played_in_cycle", [])
-    error = state.get("error_message")
-    updates = {"error_message": error}
-    if error:
-        print("Skipping selection due to previous error.")
-        return updates
-    if not stories_to_play:
-        language = state.get("selected_language", "the current language")
-        updates["error_message"] = (
-            f"Cannot select story: Cycle empty/no stories found for {language}."
-        )
-        print(updates["error_message"])
-        return updates
-    selected_id = stories_to_play.pop(0)
-    played_in_cycle.append(selected_id)
-    updates["selected_story_id"] = selected_id
-    updates["stories_to_play_cycle"] = stories_to_play
-    updates["played_in_cycle"] = played_in_cycle
-    updates["error_message"] = None
-    print(f"Selected story ID: {selected_id}")
-    return updates
-
-
-def fetch_story_data_node(state: StorytellerAgentState) -> dict:
-    print("--- Node: fetch_story_data ---")
-    story_id = state.get("selected_story_id")
-    manifest_list = state.get("stories_manifest")
-    base_path = state.get("dataset_base_path")
-    language = state.get("selected_language")
-    error = state.get("error_message")
-    updates = {
-        "error_message": error,
-        "selected_story_title": None,
-        "selected_story_content": None,
-        "selected_audio_path": None,
-    }
-    if error:
-        print("Skipping fetch due to previous error.")
-        return updates
-    if not story_id or manifest_list is None or not language or not base_path:
-        updates["error_message"] = "Cannot fetch: Missing inputs."
-        print(updates["error_message"])
-        return updates
+    print(f"Calling logic for tool: {tool_name_called}")
     try:
-        story_entry = next(
-            (
-                s
-                for s in manifest_list
-                if s.get("language") == language and s.get("story_id") == story_id
-            ),
-            None,
-        )
-        if not story_entry:
-            raise FileNotFoundError(
-                f"Entry missing for story '{story_id}' / lang '{language}'."
+        result_data = None
+        if tool_name_called == "get_available_languages":
+            result_data = get_available_languages_logic(state)
+        elif tool_name_called == "set_language":
+            result_data = set_language_logic(state, tool_args.get("language_name"))
+            if result_data.get("success"):
+                state_updates["selected_language"] = result_data["new_language"]
+                if result_data.get("reset_cycle"):
+                    state_updates["stories_to_play_cycle"] = []
+                    state_updates["played_in_cycle"] = []
+        elif tool_name_called == "get_story":
+            result_data = get_story_logic(state)
+            if result_data.get("story_selected_this_call"):
+                state_updates["stories_to_play_cycle"] = result_data[
+                    "updated_stories_to_play"
+                ]
+                state_updates["played_in_cycle"] = result_data[
+                    "updated_played_in_cycle"
+                ]
+                state_updates["current_story_title"] = result_data.get("title")
+                state_updates["current_audio_path"] = result_data.get("audio_path")
+                state_updates["output_audio_path"] = result_data.get(
+                    "audio_path"
+                )  # Signal UI
+            if result_data.get("error"):
+                state_updates["error_message"] = result_data["error"]
+        elif tool_name_called == "get_moral_from_audio":
+            result_data = get_moral_from_audio_logic(state)  # Call the stub
+            if result_data.get("ai_moral"):
+                state_updates["ai_moral_result"] = result_data[
+                    "ai_moral"
+                ]  # Store for potential future use?
+            if result_data.get("error"):
+                state_updates["error_message"] = result_data["error"]
+        else:
+            print(f"Error: Unknown tool name '{tool_name_called}' logic requested.")
+            state_updates["error_message"] = (
+                f"Attempted unknown tool logic: {tool_name_called}"
             )
-        title = story_entry["title"]
-        text_rel_path = story_entry.get("file_path")
-        audio_rel_path = story_entry.get("audio_file_path")
-        if not text_rel_path or not audio_rel_path:
-            raise ValueError("Missing text or audio path in manifest.")
-        text_full_path = os.path.join(base_path, text_rel_path.lstrip("/\\"))
-        audio_full_path = os.path.join(base_path, audio_rel_path.lstrip("/\\"))
-        if not os.path.exists(text_full_path):
-            raise FileNotFoundError(f"Text file not found: {text_full_path}")
-        with open(text_full_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        print(f"Fetched text content for '{title}'.")
-        if not os.path.exists(audio_full_path):
-            raise FileNotFoundError(f"Audio file not found: {audio_full_path}")
-        print(f"Found audio path: {audio_full_path}")
-        updates["selected_story_title"] = title
-        updates["selected_story_content"] = content
-        updates["selected_audio_path"] = str(Path(audio_full_path).resolve())
-        updates["error_message"] = None  # Store absolute path
+            result_data = {
+                "result_for_llm": f"Error: Unknown tool '{tool_name_called}'."
+            }
+
+        # Update ToolMessage content for LLM with the result string
+        if result_data and "result_for_llm" in result_data:
+            last_message.content = result_data["result_for_llm"]
+            print(f"Updated ToolMessage content to: {last_message.content[:200]}...")
+        else:
+            last_message.content = f"Tool {tool_name_called} executed."
     except Exception as e:
-        updates["error_message"] = f"Error fetching data: {e}"
-        print(updates["error_message"])
-    return updates
+        print(f"ERROR during tool logic execution ({tool_name_called}): {e}")
+        state_updates["error_message"] = f"Execution error in {tool_name_called}: {e}"
+        last_message.content = (
+            f"Failed to execute tool {tool_name_called} due to internal error: {e}"
+        )
+
+    # Return state updates + modified messages list
+    return {**state_updates, "messages": messages}
 
 
-def format_response_node(state: StorytellerAgentState) -> dict:
+# --- format_response node (only handles direct LLM replies or critical errors) ---
+def format_response(state: StorytellerAgentState) -> dict:
     print("--- Node: format_response ---")
     error = state.get("error_message")
-    request_type = state.get("user_request_type", "unknown")
-    content = state.get("selected_story_content")
-    title = state.get("selected_story_title")
-    audio_path = state.get("selected_audio_path")
-    final_response = ""
-    output_audio = None
-    # Clear error state here before potentially setting response based on it
-    updates = {"error_message": None}
-
-    if error:
-        final_response = f"I encountered an issue: {error}"
-        if request_type == "request_story" and (not content or not audio_path):
-            final_response += ". I couldn't retrieve story details."
-        final_response += ". Please try again."
-    elif request_type == "request_story":
-        if content and title and audio_path:
-            final_response = f"Okay, here is the story '{title}':\n\n---\n\n{content}\n\n---\n\nListen to the audio below. What do you think the moral of the story is?"
-            output_audio = audio_path  # Use full path from state
-            updates["selected_story_title"] = title
-            updates["selected_audio_path"] = audio_path
-        else:
-            final_response = "I wanted to tell a story, but couldn't retrieve details."
-    elif request_type == "greeting":
-        final_response = "Hello! Ask 'tell a story' or about 'languages'."
-    elif request_type == "inquire_capabilities":
-        final_response = "I tell stories! Ask 'tell a story' or about 'languages'."
-    elif request_type == "language_processed":
-        pass
-    elif request_type == "error_state":
-        final_response = "Sorry, an error occurred earlier. Can you try again?"
-    else:
-        final_response = "Not sure how to respond. Ask 'tell a story'."
+    last_message = state["messages"][-1] if state.get("messages") else None
+    response_content = ""
     updates = {
         "error_message": None,
-        "output_audio_path": output_audio,
-        "selected_story_id": None,
-        "selected_story_title": None,
-        "selected_story_content": None,
-        "selected_audio_path": None,
-        "user_request_type": None,
-        "extracted_language": None,
-    }
-    if final_response:
-        ai_message = AIMessage(content=final_response)
-        print(f"Formatted Response: {final_response[:100]}...")
+        "output_audio_path": None,
+        "current_story_title": None,
+        "current_audio_path": None,
+    }  # Clear transient state
+    if error:
+        response_content = f"I encountered an issue: {error}. Please try again."
+    elif isinstance(last_message, AIMessage) and not last_message.tool_calls:
+        response_content = last_message.content
+        print("Using final response from LLM.")
+    else:
+        response_content = "Is there anything else I can help you with?"
+        print("Formatting fallback response.")  # Fallback
+    if response_content and not (
+        isinstance(last_message, AIMessage) and not last_message.tool_calls
+    ):
+        ai_message = AIMessage(content=response_content)
+        print(f"Formatted Response Node Generated: {response_content}")
         updates["messages"] = add_messages(state.get("messages", []), [ai_message])
     else:
-        print("No new message generated by format_response.")
+        print("Format_response: Using direct LLM answer or no new message.")
     return updates
 
 
@@ -513,278 +572,220 @@ def get_available_languages_from_manifest(path):
             df = pd.read_csv(manifest_path)
             if "language" in df.columns:
                 langs = df["language"].astype(str).unique().tolist()
-                if DEFAULT_LANGUAGE in langs:
-                    langs.remove(DEFAULT_LANGUAGE)
-                    languages = [DEFAULT_LANGUAGE] + sorted(langs)
-                else:
-                    languages = sorted(langs)
+            if DEFAULT_LANGUAGE in langs:
+                langs.remove(DEFAULT_LANGUAGE)
+                languages = [DEFAULT_LANGUAGE] + sorted(langs)
+            else:
+                languages = sorted(langs)
         print(f"UI Languages found: {languages}")
         return languages
     except Exception as e:
-        print(f"Error reading manifest for UI languages: {e}")
+        print(f"Error reading manifest for UI: {e}")
         return languages
 
 
 # --- Compile Agent ---
-@sl.cache_resource  # Cache the compiled agent & memory connection
+@sl.cache_resource
 def get_compiled_agent():
     if not LLM_READY:
-        return None, None  # Don't compile if LLM failed
-    memory_file = "streamlit_storyteller_node_memory.sqlite"
+        print("LLM not ready. Cannot compile agent.")
+        return None, None
+    memory_file = "streamlit_storyteller_node_memory_v3.sqlite"  # New DB file name
     conn = None
     try:
-        conn = sqlite3.connect(
-            memory_file, check_same_thread=False
-        )  # Needs check_same_thread=False for Streamlit
+        conn = sqlite3.connect(memory_file, check_same_thread=False)
         memory = SqliteSaver(conn=conn)
         print(f"Checkpointer initialized (using '{memory_file}')")
     except Exception as e:
         print(f"Failed to initialize checkpointer: {e}")
         return None, None
 
-    # Build graph (ensure all node functions are defined above)
     builder = StateGraph(StorytellerAgentState)
-    # Add Nodes (using correct function names)
     builder.add_node("load_data", load_manifest_and_languages_node)
-    builder.add_node("determine_intent", determine_intent_llm_node)
-    builder.add_node("handle_language", handle_language_change_node)
-    builder.add_node("filter_stories", filter_stories_by_language_node)
-    builder.add_node("select_story", select_story_node)
-    builder.add_node("fetch_data", fetch_story_data_node)
-    builder.add_node("format_response", format_response_node)
-    
-    # Define Edges
-    builder.set_entry_point("load_data")
-    builder.add_edge("load_data", "determine_intent")
+    builder.add_node("agent", agent_node)
+    builder.add_node("update_state", update_state_after_tool_node)
+    # Add ToolNode using the tools list defined in Cell 1
+    if "tools" not in globals():
+        print("ERROR: 'tools' list not defined for ToolNode")
+        return None, conn  # Should not happen
+    tool_node = ToolNode(tools)
+    builder.add_node("execute_tool", tool_node)
+    builder.add_node(
+        "format_error_response", format_response
+    )  # Keep for critical errors
 
-    def route_after_intent(state):
-        intent = state.get("user_request_type")
+    builder.set_entry_point("load_data")
+    builder.add_edge("load_data", "agent")
+
+    def route_agent(state):
+        last_message = state["messages"][-1]
         error = state.get("error_message")
-        if intent == "error_state" or (error and "Manifest" in error):
-            return "format_response"
-        if intent == "request_story":
-            return "filter_stories"
-        if intent in ["ask_language_options", "set_language"]:
-            return "handle_language"
-        return "format_response"
+        if error and "Manifest" in error:
+            print("Routing: Agent -> format_error_response")
+            return "format_error_response"
+        if isinstance(last_message, AIMessage) and last_message.tool_calls:
+            print("Routing: Agent -> execute_tool")
+            return "execute_tool"
+        print("Routing: Agent -> END")
+        return END
 
     builder.add_conditional_edges(
-        "determine_intent",
-        route_after_intent,
+        "agent",
+        route_agent,
         {
-            "filter_stories": "filter_stories",
-            "handle_language": "handle_language",
-            "format_response": "format_response",
+            "execute_tool": "execute_tool",
+            "format_error_response": "format_error_response",
+            END: END,
         },
     )
-    builder.add_edge("handle_language", "format_response")
-    builder.add_edge("filter_stories", "select_story")
-    builder.add_edge("select_story", "fetch_data")
-    builder.add_edge("fetch_data", "format_response")
-    builder.add_edge("format_response", END)
+    builder.add_edge("execute_tool", "update_state")
+    builder.add_edge("update_state", "agent")
+    builder.add_edge("format_error_response", END)
 
     try:
         agent = builder.compile(checkpointer=memory)
-        print("--- Node-Based Audio+Text Storyteller Agent Compiled ---")
-        return (
-            agent,
-            conn,
-        )  # Return agent and connection (connection kept open by checkpointer)
+        print("--- Node-Based Audio+Text+MoralStub Agent Compiled ---")
+        return agent, conn
     except Exception as e:
         print(f"--- ERROR Compiling Agent: {e} ---")
-        if conn:
-            conn.close()
-        return None, None
+        return None, conn
 
 
 storyteller_agent, db_connection = get_compiled_agent()
+
 
 # --- Streamlit UI ---
 sl.title("🎧 Storyteller Bot 📖")
 
 if not storyteller_agent:
-    sl.error(
-        "Agent could not be compiled. Please check configuration (API Key, Dataset Path) and logs."
-    )
-    # Optionally provide more guidance based on LLM_READY flag etc.
+    sl.error("Agent could not be compiled. Check configuration/logs.")
     if not LLM_READY:
         sl.warning("LLM Initialization failed. Check API Key.")
     sl.stop()
 
-sl.write("Select a language and ask for a story!")
-
-    # --- Language Selection ---
-available_languages = get_available_languages_from_manifest(MANIFEST_FULL_PATH)
-
 # Initialize session state
 if "thread_id" not in sl.session_state:
     sl.session_state.thread_id = f"sl_session_{uuid.uuid4()}"
-    # Set initial language based on availability
-    sl.session_state.selected_language = (
+    available_languages_init = get_available_languages_from_manifest(MANIFEST_FULL_PATH)
+    initial_lang = (
         DEFAULT_LANGUAGE
-        if DEFAULT_LANGUAGE in available_languages
-        else available_languages[0]
+        if DEFAULT_LANGUAGE in available_languages_init
+        else available_languages_init[0] if available_languages_init else "English"
     )
-    # sl.session_state.messages = []  # UI message history (simple list of dicts)
-    # sl.session_state.last_response_text = None
+    sl.session_state.selected_language = initial_lang
     sl.session_state.audio_to_play = None
     sl.session_state.error_message = None
-    sl.session_state.display_history = []  # For st.chat_message format
-    sl.session_state.current_story_title = None # Track if a story is active
+    sl.session_state.display_history = [
+        {"role": "assistant", "content": "Hello! I'm your storyteller. How can I help?"}
+    ]
+    sl.session_state.current_story_title = None
+    sl.session_state.current_audio_path = None
     print(f"Initialized Session State for thread: {sl.session_state.thread_id}")
 
-# --- Output Area (Displays Chat and Audio) --- Moved UP
-st_output_area = sl.container(height=500, border=False)  # Use container for grouping
-with st_output_area:
-    # Display chat messages using st.chat_message
-    for msg in sl.session_state.display_history:
-        with sl.chat_message(msg["role"]):
-            # Use markdown to render potential formatting in agent responses
-            sl.markdown(msg["content"])
-
-    # Placeholder for the audio player
-    audio_placeholder = sl.empty()
-    # Display Audio Player if path is set in session state
-    if sl.session_state.audio_to_play:
-        audio_path = sl.session_state.audio_to_play
-        if os.path.exists(audio_path):
-            try:
-                print(f"Playing audio: {audio_path}")
-                audio_placeholder.audio(audio_path)
-            except Exception as audio_e:
-                sl.error(f"Streamlit error displaying audio: {audio_e}")
-                sl.session_state.audio_to_play = None  # Clear on error
-        else:
-            sl.warning(f"Audio file path set but not found by Streamlit: {audio_path}")
-            sl.session_state.audio_to_play = None  # Clear if invalid
-
-# Display error if any occurred (maybe place below controls?)
-if sl.session_state.error_message:
-    sl.error(f"Agent Error: {sl.session_state.error_message}")
-    sl.session_state.error_message = None  # Clear after showing
-
-# --- Controls Area (Language and Buttons) --- Moved BELOW Output
-st_controls_area = sl.container(border=True)
-with st_controls_area:
-    sl.write("**Controls**")  # Add a heading for clarity
+# --- Sidebar for Language Selection ---
+with sl.sidebar:
+    sl.header("Language Settings")
     available_languages = get_available_languages_from_manifest(MANIFEST_FULL_PATH)
-
     selected_lang_widget = sl.selectbox(
-        "Select Language:",
+        "Story Language:",
         options=available_languages,
-        index=available_languages.index(sl.session_state.selected_language),
+        index=(
+            available_languages.index(sl.session_state.selected_language)
+            if sl.session_state.selected_language in available_languages
+            else 0
+        ),
         key="lang_select_widget",
     )
 
-    # Update agent state if language selection changes via UI
     if selected_lang_widget != sl.session_state.selected_language:
         sl.session_state.selected_language = selected_lang_widget
-        sl.session_state.display_history.append(
-            {
-                "role": "system", 
-                "content": f"Language changed to {selected_lang_widget}.",
-            }
-        )
         sl.session_state.audio_to_play = None
-        sl.session_state.error_message = None
         sl.session_state.current_story_title = None
-        audio_placeholder.empty()  # Clear audio player immediately
-        print(f"UI Language selection changed to: {selected_lang_widget}")
+        sl.session_state.current_audio_path = None
+        # audio_placeholder.empty() # Cannot access placeholder from sidebar directly easily
+        lang_change_msg = f"Language preference updated to {selected_lang_widget}."
+        sl.session_state.display_history.append(
+            {"role": "system", "content": lang_change_msg}
+        )
+        print(f"UI Lang selection: {selected_lang_widget}")
         config = {"configurable": {"thread_id": sl.session_state.thread_id}}
+        lang_set_input_msg = f"Please use {selected_lang_widget} for stories."
         lang_set_input = {
-            "messages": [
-                HumanMessage(content=f"Set language to {selected_lang_widget}")
-            ],
+            "messages": [HumanMessage(content=lang_set_input_msg)],
             "dataset_base_path": str(DATASET_PATH),
         }
         if LLM_READY:
             try:
-                with sl.spinner(f"Switching language to {selected_lang_widget}..."):
-                    sl_final_state = storyteller_agent.invoke(
+                with sl.spinner(f"Switching language..."):
+                    sl_final_state_lang_change = storyteller_agent.invoke(
                         lang_set_input, config=config
                     )
-                if sl_final_state.get("messages"):
-                    last_msg = sl_final_state["messages"][-1]
-                    if isinstance(last_msg, AIMessage):
+                if sl_final_state_lang_change.get("messages"):
+                    last_msg_lang = sl_final_state_lang_change["messages"][-1]
+                    if isinstance(last_msg_lang, AIMessage):
                         sl.session_state.display_history.append(
-                            {"role": "assistant", "content": last_msg.content}
+                            {"role": "assistant", "content": last_msg_lang.content}
                         )
-                sl.session_state.error_message = sl_final_state.get("error_message")
+                sl.session_state.error_message = sl_final_state_lang_change.get(
+                    "error_message"
+                )
+                sl.session_state.selected_language = sl_final_state_lang_change.get(
+                    "selected_language", selected_lang_widget
+                )  # Sync language from agent state
             except Exception as e:
                 sl.error(f"Error updating language: {e}")
                 sl.session_state.error_message = str(e)
         else:
-            sl.warning("LLM not ready, cannot confirm language change.")
+            sl.warning("LLM not ready.")
         sl.rerun()
 
-    # --- Conditional Button Display ---
-    col_btn_1, col_btn_2 = sl.columns(2)  # Place buttons side-by-side
 
-    input_message = None  # Store the message for the agent
-    print(f"Session State before button click: {sl.session_state}")
-    with col_btn_1:
-        # Show EITHER "Tell me a story" OR "Tell me another story"
-        if not sl.session_state.current_story_title:  # Show if no story is active
-            if sl.button(
-                "Tell me a story", key="tell_story_btn", use_container_width=True
-            ):
-                input_message = "Tell me a story"
-        else:  # Show after a story has been played
-            if sl.button(
-                "Tell me another story",
-                key="tell_another_btn",
-                use_container_width=True,
-            ):
-                input_message = "Tell me another story"
+# --- Main Chat Area ---
+# Display chat messages first
+for msg in sl.session_state.display_history:
+    with sl.chat_message(msg["role"]):
+        sl.markdown(msg["content"])
 
-    with col_btn_2:
-        # Show "Get AI Moral" button only if a story is active
-        show_moral_button = sl.session_state.current_story_title is not None
-        if sl.button(
-            "Get AI Moral (Text)",
-            key="get_moral_btn",
-            disabled=not show_moral_button,
-            use_container_width=True,
-        ):
-            # Construct a message asking for the moral of the specific story
-            story_title_for_prompt = (
-                sl.session_state.current_story_title or "the last story"
-            )
-            input_message = f"What is the moral of the story '{story_title_for_prompt}'?"  # Use this to trigger the correct intent/tool later if using tools
-            # For the node-based version, we might need a specific intent type
-            # Let's assume the LLM intent detector can handle this phrase
-
-# --- Process Agent Invocation ---
-if input_message:
-    # Add user action to UI history
-    display_user_action = f"(Action: {input_message})" 
-    if input_message in ["Tell me a story", "Tell me another story"]:
-        display_user_action = f"(Action: {input_message})"
+# Then display the audio player if available
+audio_placeholder = sl.empty()  # Placeholder remains here
+if sl.session_state.get("audio_to_play"):
+    audio_path = sl.session_state["audio_to_play"]
+    if os.path.exists(audio_path):
+        try:
+            print(f"Displaying audio (autoplay=True): {audio_path}")
+            # *** Add autoplay=True ***
+            audio_placeholder.audio(audio_path, autoplay=True)
+            # ************************
+        except Exception as audio_e:
+            sl.error(f"Streamlit error playing audio: {audio_e}")
     else:
-        display_user_action = input_message
-    sl.session_state.display_history.append({"role": "user", "content": display_user_action})
+        sl.warning(f"Audio file path set but not found by Streamlit: {audio_path}")
 
-    # --- Clear previous outputs *before* invoking agent ---
-    # Clear previous error message
-    sl.session_state.error_message = None
-    # Clear audio/title specifically when requesting a *new* story
-    if input_message in ["Tell me a story", "Tell me another story"]:
-        sl.session_state.audio_to_play = None
-        sl.session_state.current_story_title = None # Clear title *before* new request
-        audio_placeholder.empty()
 
-    # Invoke Agent
+# Display errors at the bottom perhaps
+if sl.session_state.get("error_message"):
+    sl.error(f"Agent Error: {sl.session_state.error_message}")
+    sl.session_state.error_message = None  # Clear after showing
+
+# Chat Input at the very bottom
+if prompt := sl.chat_input("Ask for a story, its moral, or change language..."):
+    sl.session_state.display_history.append({"role": "user", "content": prompt})
+    # Clear previous audio signal before new agent call
+    sl.session_state.audio_to_play = None
+    # audio_placeholder.empty() # Rerun will clear or replace
+
     config = {"configurable": {"thread_id": sl.session_state.thread_id}}
     invoke_input = {
-        "messages": [HumanMessage(content=input_message)],
+        "messages": [HumanMessage(content=prompt)],
         "selected_language": sl.session_state.selected_language,
         "dataset_base_path": str(DATASET_PATH),
+        # Pass context needed by logic functions if they are called by state update node
+        "current_story_title": sl.session_state.get("current_story_title"),
+        "current_audio_path": sl.session_state.get("current_audio_path"),
     }
     try:
-        with sl.spinner("Thinking..."):
+        with sl.spinner("Storyteller is thinking..."):
             final_state = storyteller_agent.invoke(invoke_input, config=config)
-
-        # Process results
         sl.session_state.error_message = final_state.get("error_message")
         agent_messages = final_state.get("messages", [])
         if agent_messages:
@@ -795,28 +796,31 @@ if input_message:
                 sl.session_state.display_history.append(
                     {"role": "assistant", "content": last_ai_message.content}
                 )
-            else: # Agent ended without final message (e.g. error before format)
-                if not sl.session_state.error_message:  # Avoid duplicate error display
+            else:
+                if not sl.session_state.error_message:
                     sl.session_state.display_history.append(
                         {
                             "role": "assistant",
-                            "content": "(Agent finished without a text response)",
+                            "content": "(Agent finished without text response)",
                         }
                     )
         else:
             sl.session_state.display_history.append(
-                {"role": "assistant", "content": "(Agent did not return any messages)"}
+                {"role": "assistant", "content": "(Agent did not return messages)"}
             )
-        # Get audio path signal and story title from final state
+
+        # Update session state based on agent's final state
         sl.session_state.audio_to_play = final_state.get("output_audio_path")
-        sl.session_state.current_story_title = final_state.get(
-            "selected_story_title"
-        )  # Update active story title
+        sl.session_state.current_story_title = final_state.get("current_story_title")
+        sl.session_state.current_audio_path = final_state.get("current_audio_path")
+        sl.session_state.selected_language = final_state.get(
+            "selected_language"
+        )  # Sync lang
+
     except Exception as e:
         sl.error(f"An error occurred during agent invocation: {e}")
         sl.session_state.error_message = str(e)
         sl.session_state.display_history.append(
             {"role": "system", "content": f"Error: {e}"}
         )
-    # Rerun to display the new message, potential audio, and update buttons
-    sl.rerun()
+    sl.rerun()  # Rerun to display results
