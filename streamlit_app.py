@@ -59,7 +59,7 @@ LLM_READY = False
 MM_LLM_READY = False
 llm = None  # For text chat/planning
 mm_llm = None  # For audio analysis
-MODEL = "gemini-2.5-flash-preview-04-17"
+MODEL = "gemini-2.5-pro"
 if api_key:
     try:               
         llm = ChatGoogleGenerativeAI(
